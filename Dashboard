@@ -1,0 +1,610 @@
+"""
+Money-Center Bank Earnings Tracker — static site generator.
+
+Run:  python bank_dashboard.py
+      python bank_dashboard.py --panel bank_panel.csv --out index.html
+
+Reads the raw long-format panel written by edgar_bank_pipeline.py and emits a
+self-contained Chart.js page. No server, no Streamlit — the output is a single
+index.html suitable for GitHub Pages.
+
+Pipeline of record:
+    python edgar_bank_pipeline.py     ->  bank_panel.csv
+    python bank_dashboard.py          ->  index.html
+
+Design notes / fixes baked in:
+  - SNAPSHOT IS QUARTERLY. The previous page built its cross-bank table at
+    annual frequency, so the newest column was FY2025 and no preliminary point
+    could ever appear -- on a Q2 tracker that silently hid the whole quarter.
+  - ALLOWANCE FOR CREDIT LOSSES IS CHARTED. It was missing from the live page
+    despite being present in the panel for all seven banks.
+  - STARS KEY STRICTLY ON PRELIM_FORM_LABEL. '10-Q (manual)' rows are filed
+    figures that SEC simply has not ingested yet; they must render unstarred.
+  - SITE_URL drives og:url / og:image so link unfurls resolve to the repo that
+    actually hosts the page.
+"""
+
+import argparse
+import json
+import os
+from datetime import date
+
+import pandas as pd
+
+from edgar_bank_pipeline import (
+    METRIC_GROUPS,
+    MANUAL_FILED_LABEL,
+    PRELIM_FORM_LABEL,
+)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+SITE_URL = "https://otnnamadim.github.io/Q226BankingTrends/"
+SITE_NAME = "Aperture Insights by O. T. Nnamadim"
+AUTHOR_URL = "https://www.otnnamadim.com"
+PAGE_TITLE = "Q2 2026 Bank Earnings Financial Summary | Aperture Insights"
+HEADLINE = "Analysis of Key Financial Statement Line Items for G-SIB Banks as of June 30, 2026"
+EYEBROW = "SEC EDGAR · XBRL Company Facts · Q2 2026 Earnings Season"
+
+# Bank display order and series colours.
+COLORS = {
+    "JPM": "#ccc2f6", "BAC": "#e8998a", "C": "#6fc3d6", "WFC": "#e5c06b",
+    "GS": "#86d1a0", "MS": "#d99bce", "BK": "#aeb6c4",
+}
+
+# Metrics reported per share rather than in USD billions.
+PER_SHARE_METRICS = {"EPS (Diluted)"}
+
+# Groups rendered as sections, in order. Sourced from METRIC_GROUPS so the
+# pipeline stays the single source of truth; groups with no data are skipped
+# automatically (Assets Under Management is not tagged consistently in us-gaap).
+SECTION_NARRATIVE = {
+    "Total Revenue":
+        "Headline revenue with its three fee engines. Component definitions vary by "
+        "filer — trading revenue in particular splits across different XBRL concepts — "
+        "so trend shape within a bank is more reliable than cross-bank levels.",
+    "Net Income":
+        "The bottom line and its per-share expression. Diluted EPS reflects buybacks as "
+        "well as earnings, which is why the EPS trend can outrun net income.",
+    "Consumer Credit Quality":
+        "Three proxies read together: provisions (the forward-looking P&amp;L charge), the "
+        "allowance (the balance-sheet reserve), and net charge-offs (realized losses). "
+        "Provisions rising ahead of charge-offs signals management expects deterioration; "
+        "the reverse signals releases.",
+    "Assets Under Management":
+        "AUM is inconsistently tagged in XBRL — GS reports Assets Under Supervision, "
+        "Citi reports assets under custody/administration, and JPM discloses it only in "
+        "narrative. Shown where a us-gaap concept exists.",
+}
+
+# Why a snapshot cell is blank. Two categories that must NOT be conflated:
+#   "structural" -> the bank genuinely has no such business; the dash is correct
+#                   and complete.
+#   "tagging"    -> the bank DOES report this, but not under any us-gaap concept
+#                   in METRIC_MAPPING, so the pipeline cannot retrieve it. The
+#                   figure exists in the filing.
+# Rendering both as a bare "—" tells readers Wells Fargo has no investment
+# banking business, which is false. Each blank cell gets a hover title and a
+# footnote below the table.
+OMISSION_NOTES = {
+    ("BK", "Investment Banking Fees"): (
+        "structural",
+        "BNY Mellon is a custody and asset-servicing bank with no investment "
+        "banking segment."),
+    ("WFC", "Investment Banking Fees"): (
+        "tagging",
+        "Wells Fargo reports investment banking revenue but does not tag it "
+        "under the us-gaap concepts used here."),
+    ("WFC", "Net Charge-Offs"): (
+        "tagging",
+        "Wells Fargo does not tag quarterly net charge-offs under the us-gaap "
+        "concepts used here; the figure is disclosed in its earnings supplement."),
+}
+DEFAULT_OMISSION = (
+    "tagging",
+    "No us-gaap concept matched for this filer — likely a custom extension tag "
+    "or narrative-only disclosure.")
+
+# Filed data outranks a hand-entered filed figure, which outranks preliminary.
+FORM_PRIORITY = {
+    "10-Q/A": 5, "10-K": 4, "10-Q": 4, "8-K": 3,
+    MANUAL_FILED_LABEL: 2, PRELIM_FORM_LABEL: 1,
+}
+
+
+# ---------------------------------------------------------------------------
+# Data assembly
+# ---------------------------------------------------------------------------
+
+def load_panel(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"Panel not found at '{os.path.abspath(path)}'.\n"
+            f"Run  python edgar_bank_pipeline.py  first to produce it."
+        )
+    panel = pd.read_csv(path)
+    panel["end"] = pd.to_datetime(panel["end"], errors="coerce")
+    panel["val"] = pd.to_numeric(panel["val"], errors="coerce")
+    panel = panel[panel["end"].notna() & panel["val"].notna()].copy()
+    if panel.empty:
+        raise SystemExit(f"'{path}' contains no usable rows.")
+    return panel
+
+
+def charted_metrics(panel: pd.DataFrame) -> "list[tuple[str, list[str]]]":
+    """Group -> metrics, keeping only metrics that actually have data."""
+    present = set(panel["metric"].unique())
+    out = []
+    for group, metrics in METRIC_GROUPS.items():
+        keep = [m for m in metrics if m in present]
+        if keep:
+            out.append((group, keep))
+    return out
+
+
+def build_data(panel: pd.DataFrame, metrics: "list[str]") -> dict:
+    """Nested dict: frequency -> metric -> ticker -> [{x, y, prelim}]."""
+    work = panel[panel["metric"].isin(metrics)].copy()
+    work["prio"] = work["form"].map(FORM_PRIORITY).fillna(0)
+    work["accn"] = work["accn"].fillna("")
+    # One observation per (frequency, metric, ticker, end): filed beats manual
+    # beats preliminary; ties broken by accession so restatements win.
+    work = work.sort_values(["prio", "accn"]).groupby(
+        ["frequency", "metric", "ticker", "end"], as_index=False).tail(1)
+
+    data = {}
+    for freq in ("annual", "quarterly"):
+        data[freq] = {}
+        for metric in metrics:
+            by_bank = {}
+            for ticker in COLORS:
+                series = work[(work["frequency"] == freq)
+                              & (work["metric"] == metric)
+                              & (work["ticker"] == ticker)].sort_values("end")
+                if series.empty:
+                    continue
+                per_share = metric in PER_SHARE_METRICS
+                divisor = 1.0 if per_share else 1e9
+                places = 2 if per_share else 3
+                by_bank[ticker] = [
+                    {"x": r.end.strftime("%Y-%m-%d"),
+                     "y": round(r.val / divisor, places),
+                     "prelim": bool(r.form == PRELIM_FORM_LABEL)}
+                    for r in series.itertuples()
+                ]
+            if by_bank:
+                data[freq][metric] = by_bank
+    return data
+
+
+def build_snapshot(data: dict, metrics: "list[str]") -> "tuple[str, str, set, list]":
+    """Cross-bank table at QUARTERLY frequency — the newest quarter per bank."""
+    quarterly = data.get("quarterly", {})
+    head = ('<tr><th style="text-align:left">Bank</th>'
+            + "".join(f"<th>{m}</th>" for m in metrics) + "</tr>")
+
+    rows, prelim_banks, omissions = [], set(), []
+    for ticker, colour in COLORS.items():
+        cells = [f'<td class="tick" style="--c:{colour}">{ticker}</td>']
+        for metric in metrics:
+            points = quarterly.get(metric, {}).get(ticker)
+            if not points:
+                kind, reason = OMISSION_NOTES.get((ticker, metric), DEFAULT_OMISSION)
+                omissions.append((ticker, metric, kind, reason))
+                cells.append(f'<td class="na" title="{ticker} — {metric}: {reason}">—</td>')
+                continue
+            latest = points[-1]
+            star = "★" if latest["prelim"] else ""
+            if latest["prelim"]:
+                prelim_banks.add(ticker)
+            cells.append(f'<td>{latest["y"]:.2f}{star}</td>')
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    return head, "".join(rows), prelim_banks, omissions
+
+
+def render_omissions(omissions: "list[tuple[str, str, str, str]]") -> str:
+    """Footnote explaining every blank cell, grouped so a structural absence is
+    never mistaken for missing data (or vice versa)."""
+    if not omissions:
+        return ""
+    structural = [o for o in omissions if o[2] == "structural"]
+    tagging = [o for o in omissions if o[2] == "tagging"]
+
+    parts = ['<p class="table-note">Blank cells (—) are not errors, and they carry '
+             'two different meanings:</p><ul class="table-note">']
+    if structural:
+        for ticker, metric, _, reason in structural:
+            parts.append(f'<li><strong>{ticker} · {metric}</strong> — not applicable. '
+                         f'{reason}</li>')
+    if tagging:
+        for ticker, metric, _, reason in tagging:
+            parts.append(f'<li><strong>{ticker} · {metric}</strong> — reported by the '
+                         f'bank but not retrievable. {reason}</li>')
+    parts.append('</ul>')
+    return "".join(parts)
+
+
+def manual_filed_note(panel: pd.DataFrame) -> str:
+    """Disclose hand-entered FILED figures — they render unstarred, so the
+    page must say so explicitly rather than implying full automation."""
+    manual = panel[panel["form"] == MANUAL_FILED_LABEL]
+    if manual.empty:
+        return ""
+    parts = []
+    for ticker, grp in manual.groupby("ticker"):
+        periods = sorted({f"{r.fp} {int(r.fy)}" for r in grp.itertuples()})
+        source = str(grp["xbrl_tag"].iloc[0]).replace("manual: ", "")
+        parts.append(f"{ticker} {', '.join(periods)} ({source})")
+    return (" Hand-entered from filed 10-Qs that SEC has not yet ingested into "
+            "Company Facts: " + "; ".join(parts) +
+            ". These are filed values, not preliminary, and are shown unstarred.")
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def render_sections(sections: "list[tuple[str, list[str]]]") -> str:
+    html = []
+    for group, metrics in sections:
+        blocks = []
+        for metric in metrics:
+            unit = "$ / share" if metric in PER_SHARE_METRICS else "USD billions"
+            blocks.append(f'''
+      <figure class="chart-block">
+        <figcaption>
+          <h3>{metric}</h3>
+          <span class="unit">{unit}</span>
+        </figcaption>
+        <div class="canvas-wrap"><canvas data-metric="{metric}"></canvas></div>
+      </figure>''')
+        grid = "chart-grid cols-2" if len(metrics) > 1 else "chart-grid"
+        html.append(f'''
+    <section>
+      <h2>{group}</h2>
+      <p class="narrative">{SECTION_NARRATIVE.get(group, "")}</p>
+      <div class="{grid}">{"".join(blocks)}</div>
+    </section>''')
+    return "".join(html)
+
+
+def render_html(data, sections, thead, tbody, prelim_banks, manual_note,
+                omissions_html) -> str:
+    metrics_flat = [m for _, ms in sections for m in ms]
+    chips = "".join(
+        f'<button class="bank-chip" data-ticker="{t}" style="--c:{c}" '
+        f'aria-pressed="true">{t}</button>' for t, c in COLORS.items())
+
+    if prelim_banks:
+        banner = (f'<p class="prelim-banner">★ Preliminary, unaudited figures from '
+                  f'Q2 2026 earnings-release 8-Ks ({", ".join(sorted(prelim_banks))}). '
+                  f'Replaced automatically when the corresponding 10-Qs are filed and '
+                  f'processed.{manual_note}</p>')
+    else:
+        banner = f'<p class="prelim-banner">All charted figures are from filed reports.{manual_note}</p>' \
+            if manual_note else ""
+
+    generated = date.today().strftime("%B %-d, %Y") if os.name != "nt" else date.today().strftime("%B %d, %Y")
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{PAGE_TITLE}</title>
+
+<!-- Social sharing / link unfurl. og:image must be an absolute URL;
+     add preview.png (1200x630) to the repo for the image card to appear. -->
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="{SITE_NAME}">
+<meta property="og:title" content="{HEADLINE}">
+<meta property="og:description" content="Q2 2026 earnings, pulled from SEC filings via EDGAR: revenue mix, profitability, and consumer credit quality across the seven major U.S. banks.">
+<meta property="og:url" content="{SITE_URL}">
+<meta property="og:image" content="{SITE_URL}preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{HEADLINE}">
+<meta name="twitter:image" content="{SITE_URL}preview.png">
+<meta name="description" content="Interactive trend analysis of JPMorgan, Bank of America, Citigroup, Wells Fargo, Goldman Sachs, Morgan Stanley, and BNY Mellon from SEC EDGAR XBRL filings.">
+
+<!-- Chart.js from CDN — do not replace with a local path. Browser "Save Page As"
+     rewrites this to a local _files folder; if that happens, restore this line. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  :root {{
+    --paper:     #090d1a;   /* page background — navy-black */
+    --navy:      #01032d;   /* deep navy — tooltips, accents */
+    --panel:     #11162b;   /* chart card — lifted off the page */
+    --lavender:  #ccc2f6;   /* brand accent */
+    --grey-1:    #d9d9d9;   /* lightest */
+    --grey-2:    #c6cbd1;
+    --grey-3:    #bdbdbd;
+    --grey-4:    #8a929b;   /* muted text */
+    --rule:      #232c48;   /* hairlines on dark */
+    --warm:      #d85a30;   /* attention / preliminary */
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; background: var(--paper); color: var(--grey-4);
+    font-family: Georgia, "Times New Roman", serif;
+    padding: 40px 24px 64px;
+  }}
+  main {{ max-width: 1080px; margin: 0 auto; }}
+  .eyebrow {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--grey-1); margin: 0 0 8px;
+  }}
+  h1 {{
+    font-size: clamp(27px, 4vw, 34px); font-weight: 400; line-height: 1.25;
+    color: var(--lavender); margin: 0 0 6px; letter-spacing: -0.01em;
+  }}
+  .byline {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 13px; color: var(--grey-4); margin: 0 0 20px;
+  }}
+  .byline a {{ color: var(--lavender); text-decoration: none; }}
+  .intro {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 14.5px; color: var(--grey-2); max-width: 78ch; line-height: 1.7;
+  }}
+  .controls {{
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    margin: 26px 0 8px; padding: 14px 0;
+    border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+    position: sticky; top: 0; background: var(--paper); z-index: 5;
+  }}
+  .controls .label {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--grey-4); margin-right: 4px;
+  }}
+  .freq-btn, .bank-chip {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    border: 1px solid var(--rule); background: none; border-radius: 999px;
+    padding: 5px 13px; font-size: 13px; cursor: pointer; color: var(--grey-2);
+  }}
+  .freq-btn[aria-pressed="true"] {{
+    background: var(--lavender); color: var(--navy); border-color: var(--lavender); font-weight: 600;
+  }}
+  .bank-chip {{ display: inline-flex; align-items: center; gap: 6px; }}
+  .bank-chip::before {{ content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--c); }}
+  .bank-chip[aria-pressed="false"] {{ opacity: .32; }}
+  section {{ margin-top: 12px; }}
+  h2 {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 17px; font-weight: 600; color: var(--lavender);
+    margin: 44px 0 6px; padding-top: 28px; border-top: 1px solid var(--rule);
+  }}
+  .narrative {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    color: var(--grey-2); max-width: 78ch; margin: 0 0 18px; font-size: 13.5px; line-height: 1.7;
+  }}
+  .chart-grid {{ display: grid; gap: 20px; }}
+  .chart-grid.cols-2 {{ grid-template-columns: minmax(0,1fr) minmax(0,1fr); }}
+  @media (max-width: 860px) {{ .chart-grid.cols-2 {{ grid-template-columns: 1fr; }} }}
+  .chart-block {{
+    margin: 0; background: var(--panel); border: 1px solid var(--rule);
+    border-radius: 10px; padding: 16px 16px 10px;
+  }}
+  .chart-block figcaption {{ display: flex; align-items: baseline; justify-content: space-between; }}
+  .chart-block h3 {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px; font-weight: 600; color: var(--grey-1); margin: 0 0 2px;
+  }}
+  .chart-block .unit {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px; color: var(--grey-4);
+  }}
+  .canvas-wrap {{ position: relative; height: 300px; }}
+  .prelim-banner {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    border-left: 3px solid var(--warm); padding: 10px 14px; margin: 22px 0 0;
+    background: rgba(216, 90, 48, 0.10); font-size: 13px; color: #e9a488;
+  }}
+  .table-scroll {{ overflow-x: auto; }}
+  table {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 14px;
+  }}
+  th, td {{ text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }}
+  th {{ font-size: 11px; letter-spacing: .07em; text-transform: uppercase; color: var(--grey-4); font-weight: 600; }}
+  td {{ color: var(--grey-2); }}
+  td.tick {{ text-align: left; font-weight: 600; color: var(--grey-1); border-left: 3px solid var(--c); }}
+  td.na {{ color: var(--rule); cursor: help; }}
+  .table-note {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px; color: var(--grey-4); max-width: 84ch;
+    line-height: 1.65; margin: 14px 0 0;
+  }}
+  ul.table-note {{ padding-left: 18px; }}
+  ul.table-note li {{ margin-bottom: 5px; }}
+  .table-note strong {{ color: var(--grey-2); font-weight: 600; }}
+  footer {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    margin-top: 52px; padding-top: 20px; border-top: 1px solid var(--rule);
+    font-size: 12px; color: var(--grey-4); max-width: 84ch; line-height: 1.7;
+  }}
+</style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">{EYEBROW}</p>
+  <h1>{HEADLINE}</h1>
+  <p class="byline"><a href="{AUTHOR_URL}">Aperture Insights</a> · Generated on {generated}</p>
+  <p class="intro">
+    Every series below is pulled programmatically from each bank's SEC filings via the
+    EDGAR Company Facts API — the same numbers management signed, not headline
+    summaries. Where this quarter's 10-Q is still outstanding, preliminary figures from
+    the earnings-release 8-K are shown as ★ and clearly separated from filed data.
+  </p>
+  {banner}
+
+  <div class="controls" role="group" aria-label="View filters">
+    <span class="label">Frequency</span>
+    <button class="freq-btn" data-freq="quarterly" aria-pressed="true">Quarterly</button>
+    <button class="freq-btn" data-freq="annual" aria-pressed="false">Annual</button>
+    <span class="label" style="margin-left:12px">Banks</span>
+    {chips}
+  </div>
+{render_sections(sections)}
+
+  <section>
+    <h2>Cross-bank snapshot</h2>
+    <p class="narrative">Latest reported value per bank at quarterly frequency.
+    USD billions except EPS ($/share). ★ = preliminary 8-K figure.</p>
+    <div class="table-scroll">
+    <table>
+      <thead>{thead}</thead>
+      <tbody>{tbody}</tbody>
+    </table>
+    </div>
+    {omissions_html}
+  </section>
+
+  <footer>
+    Values from XBRL-tagged filings (10-K, 10-Q) retrieved via the SEC EDGAR Company
+    Facts API; banks tag equivalent concepts under different us-gaap elements, so
+    cross-bank levels for component metrics are indicative rather than strictly
+    comparable — the exact tag used for each series is recorded in the underlying
+    data extract. Preliminary points are hand-entered from earnings-release 8-Ks,
+    are unaudited, and may be revised in the filed 10-Q. Not investment advice; this
+    page illustrates financial statement analysis from public filings.
+  </footer>
+</main>
+<script>
+const DATA = {json.dumps(data, separators=(", ", ": "))};
+const COLORS = {json.dumps(COLORS)};
+const METRICS = {json.dumps(metrics_flat)};
+let freq = "quarterly";
+let active = new Set(Object.keys(COLORS));
+const charts = new Map();
+const TICK = "#8a929b", GRID = "rgba(204,194,246,0.09)", TT_BG = "#01032d", WARM = "#d85a30";
+
+function buildDatasets(metric) {{
+  const byBank = (DATA[freq] || {{}})[metric] || {{}};
+  return Object.entries(byBank)
+    .filter(([t]) => active.has(t))
+    .map(([t, pts]) => ({{
+      label: t,
+      data: pts,
+      borderColor: COLORS[t],
+      backgroundColor: COLORS[t],
+      borderWidth: 1.6,
+      pointRadius: pts.map(p => p.prelim ? 6 : 0),
+      pointStyle: pts.map(p => p.prelim ? "star" : "circle"),
+      pointBorderColor: pts.map(p => p.prelim ? WARM : COLORS[t]),
+      pointBackgroundColor: pts.map(p => p.prelim ? WARM : COLORS[t]),
+      segment: {{
+        borderDash: ctx => (ctx.p1.raw && ctx.p1.raw.prelim) ? [5, 4] : undefined,
+      }},
+      spanGaps: true,
+      tension: 0.1,
+    }}));
+}}
+
+function makeChart(canvas) {{
+  const metric = canvas.dataset.metric;
+  const chart = new Chart(canvas, {{
+    type: "line",
+    data: {{ datasets: buildDatasets(metric) }},
+    options: {{
+      responsive: true, maintainAspectRatio: false, animation: false,
+      parsing: {{ xAxisKey: "x", yAxisKey: "y" }},
+      interaction: {{ mode: "nearest", intersect: false }},
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{
+          backgroundColor: TT_BG, borderColor: "#232c48", borderWidth: 1,
+          titleColor: "#d9d9d9", bodyColor: "#c6cbd1",
+          titleFont: {{ family: "Helvetica Neue" }}, bodyFont: {{ family: "Helvetica Neue" }},
+          callbacks: {{
+            label: c => `${{c.dataset.label}}: ${{c.parsed.y.toLocaleString()}}` +
+                       (c.raw.prelim ? " (preliminary, 8-K)" : ""),
+          }},
+        }},
+      }},
+      scales: {{
+        x: {{ type: "time", time: {{ unit: "year" }}, grid: {{ display: false }},
+             border: {{ color: "#232c48" }},
+             ticks: {{ color: TICK, font: {{ family: "Helvetica Neue", size: 11 }} }} }},
+        y: {{ grid: {{ color: GRID }}, border: {{ color: "#232c48" }},
+             ticks: {{ color: TICK, font: {{ family: "Helvetica Neue", size: 11 }} }} }},
+      }},
+    }},
+  }});
+  charts.set(metric, chart);
+}}
+
+function refresh() {{
+  charts.forEach((chart, metric) => {{
+    chart.data.datasets = buildDatasets(metric);
+    chart.update("none");
+  }});
+}}
+
+document.querySelectorAll(".freq-btn").forEach(btn => btn.addEventListener("click", () => {{
+  freq = btn.dataset.freq;
+  document.querySelectorAll(".freq-btn").forEach(b =>
+    b.setAttribute("aria-pressed", String(b === btn)));
+  refresh();
+}}));
+
+document.querySelectorAll(".bank-chip").forEach(chip => chip.addEventListener("click", () => {{
+  const t = chip.dataset.ticker;
+  if (active.has(t) && active.size > 1) active.delete(t); else active.add(t);
+  chip.setAttribute("aria-pressed", String(active.has(t)));
+  refresh();
+}}));
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"
+        onload="document.querySelectorAll('canvas[data-metric]').forEach(makeChart)"></script>
+</body>
+</html>'''
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Build index.html from bank_panel.csv")
+    ap.add_argument("--panel", default="bank_panel.csv", help="input panel CSV")
+    ap.add_argument("--out", default="index.html", help="output HTML file")
+    args = ap.parse_args()
+
+    panel = load_panel(args.panel)
+    sections = charted_metrics(panel)
+    metrics = [m for _, ms in sections for m in ms]
+
+    data = build_data(panel, metrics)
+    thead, tbody, prelim_banks, omissions = build_snapshot(data, metrics)
+    note = manual_filed_note(panel)
+    omissions_html = render_omissions(omissions)
+
+    html = render_html(data, sections, thead, tbody, prelim_banks, note,
+                       omissions_html)
+    with open(args.out, "w", encoding="utf-8") as fh:
+        fh.write(html)
+
+    n_pts = sum(len(pts) for f in data.values() for m in f.values() for pts in m.values())
+    n_prelim = sum(1 for f in data.values() for m in f.values()
+                   for pts in m.values() for p in pts if p["prelim"])
+    latest = max((p["x"] for p in data["quarterly"].get("Total Revenue", {}).get("JPM", [])),
+                 default="n/a")
+
+    print(f"Wrote {args.out}")
+    print(f"  sections : {', '.join(g for g, _ in sections)}")
+    print(f"  metrics  : {len(metrics)}  ({', '.join(metrics)})")
+    print(f"  points   : {n_pts} ({n_prelim} preliminary)")
+    print(f"  snapshot : quarterly, latest JPM revenue point {latest}")
+    print(f"  site url : {SITE_URL}")
+    if prelim_banks:
+        print(f"  starred  : {', '.join(sorted(prelim_banks))}")
+    for ticker, metric, kind, _ in omissions:
+        print(f"  blank    : {ticker} {metric}  [{kind}]")
+
+
+if __name__ == "__main__":
+    main()
