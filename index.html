@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Money-Center Bank Earnings Tracker | Aperture Insights</title>
-
+ 
 <!-- Social sharing / link unfurl. og:image must be an absolute URL;
      add preview.png (1200x630) to the repo for the image card to appear. -->
 <meta property="og:type" content="article">
@@ -17,7 +17,7 @@
 <meta name="twitter:title" content="How the seven money-center banks are trending">
 <meta name="twitter:image" content="https://otnnamadim.github.io/BankDashboard/preview.png">
 <meta name="description" content="Interactive trend analysis of JPMorgan, Bank of America, Citigroup, Wells Fargo, Goldman Sachs, Morgan Stanley, and BNY Mellon from SEC EDGAR XBRL filings.">
-
+ 
 <!-- Chart.js from CDN — do not replace with a local path. Browser "Save Page As"
      rewrites this to a local _files folder; if that happens, restore this line. -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
@@ -143,7 +143,7 @@
     the earnings-release 8-K are shown as ★ and clearly separated from filed data.
   </p>
   <p class="prelim-banner">★ Preliminary, unaudited figures from Q2 2026 earnings-release 8-Ks (BAC, BK, C, GS, JPM, MS, WFC). Replaced automatically when the corresponding 10-Qs are filed and processed. Citigroup's Q1 2026 figures are hand-entered from its filed 10-Q (accession 0000831001-26-000019), which SEC has not yet ingested into the Company Facts aggregation; those are filed values, not preliminary, and are shown unstarred.</p>
-
+ 
   <div class="controls" role="group" aria-label="View filters">
     <span class="label">Frequency</span>
     <button class="freq-btn" data-freq="quarterly" aria-pressed="true">Quarterly</button>
@@ -151,8 +151,8 @@
     <span class="label" style="margin-left:12px">Banks</span>
     <button class="bank-chip" data-ticker="JPM" style="--c:#ccc2f6" aria-pressed="true">JPM</button><button class="bank-chip" data-ticker="BAC" style="--c:#e8998a" aria-pressed="true">BAC</button><button class="bank-chip" data-ticker="C" style="--c:#6fc3d6" aria-pressed="true">C</button><button class="bank-chip" data-ticker="WFC" style="--c:#e5c06b" aria-pressed="true">WFC</button><button class="bank-chip" data-ticker="GS" style="--c:#86d1a0" aria-pressed="true">GS</button><button class="bank-chip" data-ticker="MS" style="--c:#d99bce" aria-pressed="true">MS</button><button class="bank-chip" data-ticker="BK" style="--c:#aeb6c4" aria-pressed="true">BK</button>
   </div>
-
-
+ 
+ 
     <section>
       <h2>Total Revenue</h2>
       <p class="narrative">Headline revenue with its three fee engines. Component definitions vary by filer — trading revenue in particular splits across different XBRL concepts — so trend shape within a bank is more reliable than cross-bank levels.</p>
@@ -231,7 +231,7 @@
         <div class="canvas-wrap"><canvas data-metric="Net Charge-Offs"></canvas></div>
       </figure></div>
     </section>
-
+ 
   <section>
     <h2>Cross-bank snapshot</h2>
     <p class="narrative">Latest reported value per bank at quarterly frequency.
@@ -243,7 +243,7 @@
     </table>
     </div>
   </section>
-
+ 
   <footer>
     Values from XBRL-tagged filings (10-K, 10-Q) retrieved via the SEC EDGAR Company
     Facts API; banks tag equivalent concepts under different us-gaap elements, so
@@ -263,7 +263,7 @@ let freq = "quarterly";
 let active = new Set(Object.keys(COLORS));
 const charts = new Map();
 const TICK = "#8a929b", GRID = "rgba(204,194,246,0.09)", TT_BG = "#01032d", WARM = "#d85a30";
-
+ 
 function buildDatasets(metric) {
   const byBank = (DATA[freq] || {})[metric] || {};
   return Object.entries(byBank)
@@ -285,7 +285,7 @@ function buildDatasets(metric) {
       tension: 0.1,
     }));
 }
-
+ 
 function makeChart(canvas) {
   const metric = canvas.dataset.metric;
   const chart = new Chart(canvas, {
@@ -318,21 +318,21 @@ function makeChart(canvas) {
   });
   charts.set(metric, chart);
 }
-
+ 
 function refresh() {
   charts.forEach((chart, metric) => {
     chart.data.datasets = buildDatasets(metric);
     chart.update("none");
   });
 }
-
+ 
 document.querySelectorAll(".freq-btn").forEach(btn => btn.addEventListener("click", () => {
   freq = btn.dataset.freq;
   document.querySelectorAll(".freq-btn").forEach(b =>
     b.setAttribute("aria-pressed", String(b === btn)));
   refresh();
 }));
-
+ 
 document.querySelectorAll(".bank-chip").forEach(chip => chip.addEventListener("click", () => {
   const t = chip.dataset.ticker;
   if (active.has(t) && active.size > 1) active.delete(t); else active.add(t);
