@@ -1,0 +1,5 @@
+cd Q226BankingTrends
+touch .nojekyll
+git add .nojekyll index.html
+git commit -m "Bypass Jekyll; publish generated dashboard"
+git push
