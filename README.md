@@ -57,7 +57,7 @@ The site is a single static HTML file with no build step required to view it. Cl
 git clone https://github.com/otnnamadim/Q226BankingTrends.git
 cd Q226BankingTrends
 python3 -m http.server 8000
-# then visit http://localhost:8000
+then visit http://localhost:8000
 ```
 
 Charts are rendered with [Chart.js](https://www.chartjs.org/) loaded from a CDN, so an internet connection is needed on first load.
@@ -68,4 +68,4 @@ This project illustrates financial statement trends among the banking sector. It
 
 ## Author
 
-Built by [O. T. Nnamadim](https://www.otnnamadim.com) · *Aperture Insights*
+Built by [O. T. Nnamadim](https://www.otnnamadim.com)
