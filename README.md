@@ -6,7 +6,7 @@ The purpose of this project is to prepare an interactive trend analysis of key f
 
 ## Overview
 
-This project charts historical trends in revenue, profitability, and consumer credit quality for each of the eight (8) U.S. G-SIBs:
+This project charts historical trends in revenue, net interest income, operating margin and consumer credit quality for each of the eight (8) U.S. based G-SIBs:
 
 | Ticker | Bank | SEC Filings |
 | ------ | ---- | ---- |
